@@ -23,7 +23,7 @@ const state = {
   rows: [],
   mapping: {},
   groups: [],
-  fileType: "f68k",
+  fileType: "account",
   dataFilterColumn: "",
   dataFilterValue: "__all",
   sourceName: "",
@@ -34,7 +34,6 @@ const els = {
   dropZone: document.querySelector("#dropZone"),
   threshold: document.querySelector("#threshold"),
   thresholdValue: document.querySelector("#thresholdValue"),
-  moduleSelect: document.querySelector("#moduleSelect"),
   dataFilter: document.querySelector("#dataFilter"),
   minSignals: document.querySelector("#minSignals"),
   patternMinSize: document.querySelector("#patternMinSize"),
@@ -90,19 +89,6 @@ els.autoMapBtn.addEventListener("click", () => {
   renderMapping();
 });
 
-els.moduleSelect.addEventListener("change", () => {
-  state.fileType = els.moduleSelect.value;
-  if (!state.headers.length) return;
-  state.mapping = inferMapping(state.headers);
-  state.groups = [];
-  populateDataFilter();
-  resetOutputsForModuleChange();
-  updateMetrics();
-  renderMapping();
-  renderPreview();
-  showMessage(els.results, moduleReadyMessage());
-});
-
 els.analyzeBtn.addEventListener("click", async () => {
   els.analyzeBtn.disabled = true;
   els.exportCsvBtn.disabled = true;
@@ -129,7 +115,7 @@ els.dataFilter.addEventListener("change", () => {
   els.exportJsonBtn.disabled = true;
   updateMetrics();
   renderPreview();
-  showMessage(els.results, "Đã đổi bộ lọc. Bấm phân tích để chạy lại dữ liệu đang chọn.");
+  showMessage(els.results, "Đã đổi loại data. Bấm phân tích để chạy lại bộ lọc.");
 });
 
 async function loadFile(file) {
@@ -151,8 +137,7 @@ async function loadFile(file) {
     .slice(1)
     .filter((row) => row.some((cell) => String(cell || "").trim() !== ""))
     .map((row, rowIndex) => rowToObject(row, rowIndex));
-  state.fileType = detectFileType(state.headers, file.name);
-  els.moduleSelect.value = state.fileType;
+  state.fileType = detectFileType(state.headers);
   state.mapping = inferMapping(state.headers);
   state.groups = [];
   populateDataFilter();
@@ -169,45 +154,15 @@ async function loadFile(file) {
   renderPreview();
   showMessage(
     els.results,
-    moduleReadyMessage()
+    state.fileType === "wager_link"
+      ? "Đã nhận diện file đối cược. Bấm phân tích để gom nhóm theo cột M."
+      : "Dữ liệu đã sẵn sàng. Bấm phân tích để tìm nhóm nghi ngờ."
   );
 }
 
-function detectFileType(headers, sourceName = "") {
+function detectFileType(headers) {
   const normalizedHeaders = headers.map((header) => normalizeHeader(header));
-  const normalizedName = normalizeHeader(sourceName);
-
-  if (
-    normalizedHeaders[12] === "loailienket" ||
-    normalizedHeaders.includes("loailienket") ||
-    normalizedHeaders.includes("thongtinlienketcuthe") ||
-    normalizedName.includes("doicuoc")
-  ) {
-    return "wager_link";
-  }
-
-  if (normalizedName.includes("fn01")) return "fn01";
-  if (normalizedName.includes("f68k") || normalizedHeaders.includes("dangkytenmien")) return "f68k";
-  if (normalizedHeaders.includes("diemthuong") && normalizedHeaders.includes("nganhang")) return "fn01";
-
-  return "f68k";
-}
-
-function moduleReadyMessage() {
-  if (state.fileType === "wager_link") {
-    return "Module Đối cược đã sẵn sàng. Bấm phân tích để gom nhóm theo Loại liên kết và Thông tin liên kết cụ thể.";
-  }
-  if (state.fileType === "fn01") {
-    return "Module FN01 đã sẵn sàng. Bấm phân tích để tìm nhóm nghi ngờ theo IP, thiết bị, fingerprint, ngân hàng và tài khoản.";
-  }
-  return "Module F68K đã sẵn sàng. Bấm phân tích để tìm nhóm nghi ngờ theo IP, thiết bị, domain, ngân hàng và tài khoản.";
-}
-
-function resetOutputsForModuleChange() {
-  els.searchInput.disabled = true;
-  els.exportCsvBtn.disabled = true;
-  els.exportColorXlsBtn.disabled = true;
-  els.exportJsonBtn.disabled = true;
+  return normalizedHeaders.includes("loailienket") && normalizedHeaders.includes("thongtinlienketcuthe") ? "wager_link" : "account";
 }
 
 function normalizeHeader(value) {
@@ -271,33 +226,9 @@ async function parseFile(file) {
     return XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: "" });
   }
 
-  const buffer = await file.arrayBuffer();
-  const text = decodeTextFile(buffer);
+  const text = await file.text();
   const delimiter = detectDelimiter(text);
   return parseDelimited(text, delimiter);
-}
-
-function decodeTextFile(buffer) {
-  const bytes = new Uint8Array(buffer);
-  if (bytes.length >= 2) {
-    if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes);
-    if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes);
-  }
-
-  const utf8 = new TextDecoder("utf-8").decode(bytes);
-  if (!utf8.includes("\uFFFD")) return utf8;
-
-  const fallbackEncodings = ["windows-1258", "windows-1252"];
-  for (const encoding of fallbackEncodings) {
-    try {
-      const decoded = new TextDecoder(encoding).decode(bytes);
-      if (!decoded.includes("\uFFFD")) return decoded;
-    } catch {
-      // Some browsers may not expose every legacy encoding.
-    }
-  }
-
-  return utf8;
 }
 
 function rowToObject(row, rowIndex) {
@@ -309,86 +240,11 @@ function rowToObject(row, rowIndex) {
 }
 
 function detectDelimiter(text) {
+  const firstLine = text.split(/\r?\n/).find(Boolean) || "";
   const candidates = [",", "\t", ";", "|"];
-  const sampleRows = parseDelimitedPreview(text, 12);
   return candidates
-    .map((delimiter) => {
-      const counts = sampleRows.map((line) => countDelimiterOutsideQuotes(line, delimiter));
-      const usableCounts = counts.filter((count) => count > 0);
-      const average = usableCounts.reduce((sum, count) => sum + count, 0) / Math.max(usableCounts.length, 1);
-      const consistency = new Set(usableCounts).size <= 1 ? 1 : 0;
-      return { delimiter, score: average + consistency };
-    })
-    .sort((a, b) => b.score - a.score)[0].delimiter;
-}
-
-function parseDelimitedPreview(text, maxRows) {
-  const rows = [];
-  let line = "";
-  let quoted = false;
-  let atCellStart = true;
-
-  for (let index = 0; index < text.length && rows.length < maxRows; index += 1) {
-    const char = text[index];
-    const next = text[index + 1];
-
-    if (char === '"') {
-      if (quoted && next === '"') {
-        line += char + next;
-        index += 1;
-      } else if (quoted || atCellStart) {
-        quoted = !quoted;
-        line += char;
-      } else {
-        line += char;
-      }
-      continue;
-    }
-
-    if ((char === "\n" || char === "\r") && !quoted) {
-      if (line.trim()) rows.push(line);
-      line = "";
-      atCellStart = true;
-      if (char === "\r" && next === "\n") index += 1;
-      continue;
-    }
-
-    line += char;
-    atCellStart = false;
-  }
-
-  if (line.trim() && rows.length < maxRows) rows.push(line);
-  return rows;
-}
-
-function countDelimiterOutsideQuotes(line, delimiter) {
-  let count = 0;
-  let quoted = false;
-  let atCellStart = true;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    const next = line[index + 1];
-
-    if (char === '"') {
-      if (quoted && next === '"') {
-        index += 1;
-      } else if (quoted || atCellStart) {
-        quoted = !quoted;
-      }
-      continue;
-    }
-
-    if (char === delimiter && !quoted) {
-      count += 1;
-      atCellStart = true;
-      continue;
-    }
-
-    atCellStart = false;
-  }
-
-  return count;
+    .map((delimiter) => ({ delimiter, count: firstLine.split(delimiter).length }))
+    .sort((a, b) => b.count - a.count)[0].delimiter;
 }
 
 function parseDelimited(text, delimiter) {
@@ -396,7 +252,6 @@ function parseDelimited(text, delimiter) {
   let row = [];
   let cell = "";
   let quoted = false;
-  let atCellStart = true;
 
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
@@ -406,10 +261,8 @@ function parseDelimited(text, delimiter) {
       if (quoted && next === '"') {
         cell += '"';
         index += 1;
-      } else if (quoted || atCellStart) {
-        quoted = !quoted;
       } else {
-        cell += char;
+        quoted = !quoted;
       }
       continue;
     }
@@ -417,7 +270,6 @@ function parseDelimited(text, delimiter) {
     if (char === delimiter && !quoted) {
       row.push(cell);
       cell = "";
-      atCellStart = true;
       continue;
     }
 
@@ -427,16 +279,10 @@ function parseDelimited(text, delimiter) {
       rows.push(row);
       row = [];
       cell = "";
-      atCellStart = true;
       continue;
     }
 
     cell += char;
-    atCellStart = false;
-  }
-
-  if (quoted) {
-    throw new Error("CSV bị lỗi: có ô mở dấu ngoặc kép nhưng chưa đóng. Hãy kiểm tra lại dấu \" trong file.");
   }
 
   row.push(cell);
@@ -561,28 +407,13 @@ async function analyzeRows() {
   if (state.fileType === "wager_link") {
     return analyzeWagerLinkRows();
   }
-  if (state.fileType === "fn01") {
-    return analyzeFn01Rows();
-  }
 
-  return analyzeF68kRows();
-}
-
-async function analyzeF68kRows() {
-  return analyzeAccountRows("F68K");
-}
-
-async function analyzeFn01Rows() {
-  return analyzeAccountRows("FN01");
-}
-
-async function analyzeAccountRows(moduleName) {
   const sourceRows = rowsForCurrentFilter();
   const normalized = sourceRows.map((row) => normalizeRow(row));
   const links = [];
   const threshold = Number(els.threshold.value);
   const minSignals = Number(els.minSignals.value);
-  showProgress(`Module ${moduleName}: đang tạo cặp ứng viên`, 5);
+  showProgress("Đang tạo cặp ứng viên", 5);
   await waitFrame();
   const candidatePairs = buildCandidatePairsFast(normalized);
   const pairList = [...candidatePairs];
@@ -642,9 +473,13 @@ async function analyzeWagerLinkRows() {
   showProgress("Đang tổng hợp thông tin liên kết", 20);
   await waitFrame();
 
-  const linkColumn = state.headers[12];
-  const detailColumn = state.headers[13];
+  const linkColumn = findHeaderByNormalized("loailienket");
+  const detailColumn = findHeaderByNormalized("thongtinlienketcuthe");
   const nameColumn = findHeaderByNormalized("hotenthat");
+  if (!linkColumn || !detailColumn) {
+    showProgress("Thieu cot doi cuoc", 100);
+    return [];
+  }
   const accounts = new Map();
 
   rowsForCurrentFilter().forEach((row) => {
@@ -713,7 +548,7 @@ async function analyzeWagerLinkRows() {
     .map((bucket) => ({
       id: groupId++,
       source: "Đối cược - 2 điều kiện",
-      recommendation: moduleRecommendation("wagerLink"),
+      recommendation: "Nhóm tài khoản trùng đồng thời 2 loại thông tin liên kết. Dùng họ tên không space để rà soát chi tiết.",
       maxScore: 0,
       members: bucket.members,
       links: [],
@@ -995,8 +830,8 @@ function addCandidateBucket(buckets, key, rowIndex) {
         id: nextId++,
         source: bucket.danger ? "Browser nguy hiểm" : "Mẫu nhân viên",
         recommendation: bucket.danger
-          ? moduleRecommendation("dangerBrowser")
-          : moduleRecommendation("staffPattern"),
+          ? "Nguy hiểm 100%: Opera/Brave/Edge. Ưu tiên đưa vào lạm dụng và cấm khuyến mãi sau khi đối chiếu chiến dịch."
+          : "Cùng ngân hàng và đầu số. Cần đối chiếu KM F68K trước khi đưa vào lạm dụng/cấm khuyến mãi.",
         maxScore,
         members,
         links: [],
@@ -1018,7 +853,7 @@ function calibrateGroupRisk(group) {
       ...group,
       source: "Browser nguy hiểm",
       maxScore: 100,
-      recommendation: moduleRecommendation("dangerBrowser"),
+      recommendation: "Nguy hiểm 100%: Opera/Brave/Edge. Ưu tiên kiểm tra và xử lý lạm dụng nếu khớp chiến dịch.",
     };
   }
 
@@ -1027,7 +862,7 @@ function calibrateGroupRisk(group) {
       ...group,
       source: "Phổ thông",
       maxScore: Math.min(group.maxScore, 35),
-      recommendation: moduleRecommendation("broadCommon"),
+      recommendation: "Tín hiệu quá phổ biến, chưa đủ kết luận lạm dụng. Cần lọc thêm theo fingerprint, IP, tên, giao dịch hoặc thời gian.",
     };
   }
 
@@ -1036,14 +871,14 @@ function calibrateGroupRisk(group) {
       ...group,
       source: "Cần lọc thêm",
       maxScore: Math.min(group.maxScore, 55),
-      recommendation: moduleRecommendation("broadReview"),
+      recommendation: "Nhóm khá rộng. Chỉ nên dùng làm danh sách rà soát, chưa tự động đưa vào lạm dụng.",
     };
   }
 
   if (group.source === "Mẫu nhân viên" && memberCount <= 15) {
     return {
       ...group,
-      recommendation: moduleRecommendation("smallStaffPattern"),
+      recommendation: "Nhóm nhỏ cùng ngân hàng, đầu số, domain và thiết bị. Cần đối chiếu KM F68K trước khi xử lý.",
     };
   }
 
@@ -1082,33 +917,6 @@ function classifyBrowserGroup(value) {
   if (/opera|opr\//i.test(value)) return "Opera";
   if (/brave|edge/i.test(value)) return "Brave & Edge";
   return "";
-}
-
-function activeModuleLabel() {
-  if (state.fileType === "fn01") return "FN01";
-  if (state.fileType === "wager_link") return "Đối cược";
-  return "F68K";
-}
-
-function moduleRecommendation(kind) {
-  const moduleLabel = activeModuleLabel();
-  const copy = {
-    dangerBrowser:
-      "Browser rủi ro cao. Ưu tiên kiểm tra cùng IP, fingerprint, thiết bị và giao dịch trong file hiện tại.",
-    staffPattern:
-      `Cụm cùng ngân hàng, đầu số tài khoản, domain và thiết bị. Ưu tiên rà soát trong module ${moduleLabel}.`,
-    broadCommon:
-      "Tín hiệu quá phổ biến, chưa đủ kết luận. Cần lọc thêm theo fingerprint, IP, tên, giao dịch hoặc thời gian trong file hiện tại.",
-    broadReview:
-      "Nhóm khá rộng. Chỉ dùng làm danh sách rà soát thủ công, chưa tự động đưa vào diện xử lý.",
-    smallStaffPattern:
-      `Nhóm nhỏ cùng ngân hàng, đầu số, domain và thiết bị. Ưu tiên kiểm tra chi tiết trong module ${moduleLabel}.`,
-    usernameStyle:
-      "Cùng kiểu đặt tên tài khoản. Dùng để rà soát mở rộng, chưa đủ kết luận nếu không có IP, fingerprint, thiết bị hoặc giao dịch đi kèm.",
-    wagerLink:
-      "Nhóm tài khoản trùng đồng thời 2 loại thông tin liên kết. Dùng họ tên không space và chi tiết liên kết để rà soát trong file Đối cược hiện tại.",
-  };
-  return copy[kind] || "";
 }
 
 function buildStaffPatternGroupsFast(normalized, startId) {
@@ -1173,8 +981,8 @@ function buildStaffPatternGroupsFast(normalized, startId) {
         id: nextId++,
         source: bucket.danger ? "Browser nguy hiểm" : "Mẫu nhân viên",
         recommendation: bucket.danger
-          ? moduleRecommendation("dangerBrowser")
-          : moduleRecommendation("staffPattern"),
+          ? "Nguy hiểm 100%: Opera/Brave/Edge. Ưu tiên kiểm tra và xử lý lạm dụng nếu khớp chiến dịch."
+          : "Cùng ngân hàng, đầu số, domain và thiết bị. Cần đối chiếu KM F68K trước khi xử lý.",
         maxScore: bucket.danger ? 100 : Math.min(92, 54 + Math.min(20, members.length * 2) + bucket.signals.size * 3),
         members,
         links: [],
@@ -1270,7 +1078,7 @@ function buildUsernameStyleGroupsFast(normalized, startId) {
       return {
         id: nextId++,
         source: "Mẫu tên đăng nhập",
-        recommendation: moduleRecommendation("usernameStyle"),
+        recommendation: "Cùng kiểu đặt tên tài khoản. Dùng để rà soát mở rộng, chưa đủ kết luận lạm dụng nếu không có IP/fingerprint/giao dịch đi kèm.",
         maxScore: Math.min(52, 30 + Math.min(14, members.length) + bucket.signals.size * 4),
         members,
         links: [],
@@ -1661,7 +1469,7 @@ function renderGroup(group) {
   const identifierColumns = state.headers.filter((header) => state.mapping[header] === "account_id");
   const displayColumns =
     state.fileType === "wager_link"
-      ? [...state.headers.slice(0, 14), "ho_ten_khong_space"]
+      ? [...state.headers, "ho_ten_khong_space"]
       : [
           ...identifierColumns,
           ...state.headers.filter((header) => state.mapping[header] !== "ignore" && !identifierColumns.includes(header)),
