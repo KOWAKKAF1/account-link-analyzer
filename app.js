@@ -156,13 +156,20 @@ async function loadFile(file) {
     els.results,
     state.fileType === "wager_link"
       ? "Đã nhận diện file đối cược. Bấm phân tích để gom nhóm theo cột M."
-      : "Dữ liệu đã sẵn sàng. Bấm phân tích để tìm nhóm nghi ngờ."
+      : state.fileType === "promotion_review"
+        ? "Da nhan dien file duyet KM. Bam phan tich de tim tai khoan tu choi khong cung pattern."
+        : "Dữ liệu đã sẵn sàng. Bấm phân tích để tìm nhóm nghi ngờ."
   );
 }
 
 function detectFileType(headers) {
   const normalizedHeaders = headers.map((header) => normalizeHeader(header));
+  if (isPromotionReviewFile(normalizedHeaders)) return "promotion_review";
   return normalizedHeaders.includes("loailienket") && normalizedHeaders.includes("thongtinlienketcuthe") ? "wager_link" : "account";
+}
+
+function isPromotionReviewFile(normalizedHeaders) {
+  return ["taikhoan", "lydotuchoi", "nhanvienxuly"].every((name) => normalizedHeaders.includes(name));
 }
 
 function normalizeHeader(value) {
@@ -202,7 +209,7 @@ function populateDataFilter() {
 }
 
 function findDataFilterColumn() {
-  const candidates = ["thethanhvien", "thethanhvien", "card", "membercard", "campaign", "chuongtrinh"];
+  const candidates = ["thethanhvien", "thethanhvien", "makhuyenmai", "nhanvienxuly", "card", "membercard", "campaign", "chuongtrinh"];
   return state.headers.find((header) => candidates.includes(normalizeHeader(header))) || "";
 }
 
@@ -407,6 +414,9 @@ async function analyzeRows() {
   if (state.fileType === "wager_link") {
     return analyzeWagerLinkRows();
   }
+  if (state.fileType === "promotion_review") {
+    return analyzePromotionReviewRows();
+  }
 
   const sourceRows = rowsForCurrentFilter();
   const normalized = sourceRows.map((row) => normalizeRow(row));
@@ -467,6 +477,162 @@ function hideProgress() {
 
 function waitFrame() {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function analyzePromotionReviewRows() {
+  showProgress("Dang doc quyet dinh duyet KM", 15);
+  await waitFrame();
+
+  const columns = getPromotionReviewColumns();
+  if (!columns.account || !columns.rejectReason) return [];
+
+  const sourceRows = rowsForCurrentFilter().filter((row) => isF68kPromotionRow(row, columns));
+  const rejectedRows = sourceRows.filter((row) => String(row[columns.rejectReason] || "").trim());
+  showProgress(`Dang lap pattern ${rejectedRows.length.toLocaleString("vi-VN")} dong tu choi`, 35);
+  await waitFrame();
+
+  const rowPatterns = new Map();
+  const buckets = new Map();
+  rejectedRows.forEach((row) => {
+    const patterns = promotionReviewPatterns(row, columns);
+    rowPatterns.set(row.__rowNumber, patterns);
+    patterns.forEach((pattern) => {
+      if (!buckets.has(pattern.key)) buckets.set(pattern.key, { ...pattern, members: [] });
+      buckets.get(pattern.key).members.push(row);
+    });
+  });
+
+  showProgress("Dang tim dong tu choi le pattern", 70);
+  await waitFrame();
+
+  let groupId = 1;
+  return rejectedRows
+    .map((row) => {
+      const matches = (rowPatterns.get(row.__rowNumber) || [])
+        .map((pattern) => buckets.get(pattern.key))
+        .filter((bucket) => bucket && bucket.members.length > 1);
+      const strongMatches = matches.filter((bucket) => bucket.strength === "strong");
+      const uniqueMatches = new Set();
+      matches.forEach((bucket) => {
+        bucket.members.forEach((member) => {
+          if (member.__rowNumber !== row.__rowNumber) uniqueMatches.add(member.__rowNumber);
+        });
+      });
+      const patternSummary = matches
+        .map((bucket) => `${bucket.label}: ${bucket.value} (${bucket.members.length})`)
+        .slice(0, 8)
+        .join("; ");
+      row.pattern_status = strongMatches.length ? "co_pattern_manh" : matches.length ? "chi_co_pattern_yeu" : "khong_cung_pattern";
+      row.pattern_matches = uniqueMatches.size;
+      row.pattern_signals = patternSummary || "Khong co cum dac diem lap lai trong cac dong tu choi";
+      return { row, matches, strongMatches };
+    })
+    .filter((item) => item.strongMatches.length === 0)
+    .map((item) => ({
+      id: groupId++,
+      source: "Tu choi khong cung pattern",
+      recommendation: "Can kiem tra lai quyet dinh tu choi: tai khoan nay khong co pattern manh lap lai voi cac dong tu choi khac trong file.",
+      maxScore: item.matches.length ? 20 : 0,
+      members: [item.row],
+      links: [],
+      signals: [
+        {
+          type: "reject_reason",
+          label: "Ly do tu choi",
+          value: item.row[columns.rejectReason] || "",
+          similarity: 1,
+          weight: 0,
+        },
+        {
+          type: "pattern_matches",
+          label: "Dong tu choi cung pattern",
+          value: String(item.row.pattern_matches),
+          similarity: 1,
+          weight: 0,
+        },
+        {
+          type: "pattern_signals",
+          label: "Pattern tim thay",
+          value: item.row.pattern_signals,
+          similarity: 1,
+          weight: 0,
+        },
+      ],
+    }));
+}
+
+function getPromotionReviewColumns() {
+  return {
+    page: findHeaderByNormalized("trang"),
+    submittedAt: findHeaderByNormalized("thoigiangui"),
+    agent: findHeaderByNormalized("daily"),
+    account: findHeaderByNormalized("taikhoan"),
+    fullName: findHeaderByNormalized("tenchuthe"),
+    bankName: findHeaderByNormalized("tennganhang"),
+    bankAccount: findHeaderByNormalized("sotaikhoan"),
+    campaign: findHeaderByNormalized("makhuyenmai"),
+    content: findHeaderByNormalized("noidung"),
+    rejectReason: findHeaderByNormalized("lydotuchoi"),
+    staff: findHeaderByNormalized("nhanvienxuly"),
+    realIp: findHeaderByNormalized("ipthucte"),
+    ip: findHeaderByNormalized("ip"),
+    fp: findHeaderByNormalized("fp"),
+    bonus: findHeaderByNormalized("diemthuong"),
+    wager: findHeaderByNormalized("vongcuoc"),
+    lastDeposit: findHeaderByNormalized("napcuoi"),
+  };
+}
+
+function isF68kPromotionRow(row, columns) {
+  if (!columns.campaign) return true;
+  return normalizeHeader(row[columns.campaign]) === "f68k";
+}
+
+function promotionReviewPatterns(row, columns) {
+  const patterns = [];
+  const add = (type, label, value, strength = "strong") => {
+    const normalized = normalizePatternValue(value);
+    if (!normalized) return;
+    patterns.push({ key: `${type}:${normalized}`, type, label, value: String(value).trim(), strength });
+  };
+
+  const agent = row[columns.agent];
+  const bank = row[columns.bankName];
+  const bankPrefix = bankAccountPrefix(row[columns.bankAccount]);
+  const ip = row[columns.ip] || row[columns.realIp];
+  const ipRange = ipNetworkPattern(ip);
+  const fp = row[columns.fp];
+
+  add("fp", "FP", fp);
+  add("ip", "IP", ip);
+  add("ip_range", "Dai IP", ipRange);
+  if (bank && bankPrefix) add("bank_prefix", "Ngan hang + dau STK", `${bank}|${bankPrefix}`);
+  if (agent && bank) add("agent_bank", "Dai ly + ngan hang", `${agent}|${bank}`, "weak");
+  if (agent && ipRange) add("agent_ip_range", "Dai ly + dai IP", `${agent}|${ipRange}`);
+  return patterns;
+}
+
+function bankAccountPrefix(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  return digits.length >= 4 ? digits.slice(0, 4) : "";
+}
+
+function ipNetworkPattern(value) {
+  const ip = String(value || "").trim();
+  const ipv4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/);
+  if (ipv4) return `${ipv4[1]}.${ipv4[2]}.${ipv4[3]}.*`;
+  if (ip.includes(":")) {
+    const parts = ip.split(":").filter(Boolean);
+    if (parts.length >= 4) return `${parts.slice(0, 4).join(":")}::*`;
+  }
+  return "";
+}
+
+function normalizePatternValue(value) {
+  return removeVietnameseMarks(String(value || ""))
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9:.*|]+/g, "");
 }
 
 async function analyzeWagerLinkRows() {
@@ -1467,9 +1633,10 @@ function renderResults() {
 
 function renderGroup(group) {
   const identifierColumns = state.headers.filter((header) => state.mapping[header] === "account_id");
+  const extraHeaders = extraResultHeaders();
   const displayColumns =
-    state.fileType === "wager_link"
-      ? [...state.headers, "ho_ten_khong_space"]
+    state.fileType === "wager_link" || state.fileType === "promotion_review"
+      ? [...state.headers, ...extraHeaders]
       : [
           ...identifierColumns,
           ...state.headers.filter((header) => state.mapping[header] !== "ignore" && !identifierColumns.includes(header)),
@@ -1535,15 +1702,21 @@ function updateMetrics() {
   els.groupCount.textContent = state.groups.length.toLocaleString("vi-VN");
   els.linkedCount.textContent = linkedRows.size.toLocaleString("vi-VN");
   els.topScore.textContent =
-    state.fileType === "wager_link"
+    state.fileType === "wager_link" || state.fileType === "promotion_review"
       ? "-"
       : state.groups.length
         ? Math.max(...state.groups.map((group) => group.maxScore))
         : 0;
 }
 
+function extraResultHeaders() {
+  if (state.fileType === "wager_link") return ["ho_ten_khong_space"];
+  if (state.fileType === "promotion_review") return ["pattern_status", "pattern_matches", "pattern_signals"];
+  return [];
+}
+
 function exportCsv() {
-  const extraHeaders = state.fileType === "wager_link" ? ["ho_ten_khong_space"] : [];
+  const extraHeaders = extraResultHeaders();
   const rows = [["group_id", "signals", "group_type", "recommendation", "risk_score", "row_number", ...state.headers, ...extraHeaders]];
   state.groups.forEach((group) => {
     const signals = group.signals.map((signal) => `${signal.label}: ${signal.value}`).join("; ");
@@ -1564,7 +1737,7 @@ function exportCsv() {
 }
 
 function exportColoredXls() {
-  const extraHeaders = state.fileType === "wager_link" ? ["ho_ten_khong_space"] : [];
+  const extraHeaders = extraResultHeaders();
   const duplicateInfo = buildCrossGroupDuplicateInfo();
   const duplicateHeaders = ["trung_nhieu_nhom", "cac_nhom_da_xuat_hien"];
   const headers = [
