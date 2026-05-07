@@ -24,6 +24,7 @@ const state = {
   mapping: {},
   groups: [],
   fileType: "account",
+  analysisModule: "auto",
   dataFilterColumn: "",
   dataFilterValue: "__all",
   sourceName: "",
@@ -34,6 +35,7 @@ const els = {
   dropZone: document.querySelector("#dropZone"),
   threshold: document.querySelector("#threshold"),
   thresholdValue: document.querySelector("#thresholdValue"),
+  analysisModule: document.querySelector("#analysisModule"),
   dataFilter: document.querySelector("#dataFilter"),
   minSignals: document.querySelector("#minSignals"),
   patternMinSize: document.querySelector("#patternMinSize"),
@@ -58,6 +60,22 @@ const els = {
 
 els.threshold.addEventListener("input", () => {
   els.thresholdValue.value = els.threshold.value;
+});
+
+els.analysisModule.addEventListener("change", () => {
+  state.analysisModule = els.analysisModule.value;
+  if (!state.headers.length) return;
+  state.fileType = detectFileType(state.headers);
+  state.groups = [];
+  state.mapping = inferMapping(state.headers);
+  els.searchInput.disabled = true;
+  els.exportCsvBtn.disabled = true;
+  els.exportColorXlsBtn.disabled = true;
+  els.exportJsonBtn.disabled = true;
+  updateMetrics();
+  renderMapping();
+  renderPreview();
+  showMessage(els.results, moduleReadyMessage());
 });
 
 els.fileInput.addEventListener("change", (event) => {
@@ -152,20 +170,20 @@ async function loadFile(file) {
   updateMetrics();
   renderMapping();
   renderPreview();
-  showMessage(
-    els.results,
-    state.fileType === "wager_link"
-      ? "Đã nhận diện file đối cược. Bấm phân tích để gom nhóm theo cột M."
-      : state.fileType === "promotion_review"
-        ? "Da nhan dien file duyet KM. Bam phan tich de tim tai khoan tu choi khong cung pattern."
-        : "Dữ liệu đã sẵn sàng. Bấm phân tích để tìm nhóm nghi ngờ."
-  );
+  showMessage(els.results, moduleReadyMessage());
 }
 
 function detectFileType(headers) {
+  if (state.analysisModule && state.analysisModule !== "auto") return state.analysisModule;
   const normalizedHeaders = headers.map((header) => normalizeHeader(header));
   if (isPromotionReviewFile(normalizedHeaders)) return "promotion_review";
   return normalizedHeaders.includes("loailienket") && normalizedHeaders.includes("thongtinlienketcuthe") ? "wager_link" : "account";
+}
+
+function moduleReadyMessage() {
+  if (state.fileType === "wager_link") return "Đã chọn module đối cược. Bấm phân tích để gom nhóm theo thông tin liên kết.";
+  if (state.fileType === "promotion_review") return "Đã chọn module kiểm duyệt F68K Admin_TTKM. Bấm phân tích để gom theo số dấu hiệu tối thiểu.";
+  return "Dữ liệu đã sẵn sàng ở module tài khoản/F68K cũ. Bấm phân tích để tìm nhóm nghi ngờ.";
 }
 
 function isPromotionReviewFile(normalizedHeaders) {
@@ -486,79 +504,162 @@ async function analyzePromotionReviewRows() {
   const columns = getPromotionReviewColumns();
   if (!columns.account || !columns.rejectReason) return [];
 
+  const minSignals = Number(els.minSignals.value) || 3;
   const sourceRows = rowsForCurrentFilter().filter((row) => isF68kPromotionRow(row, columns));
   const rejectedRows = sourceRows.filter((row) => String(row[columns.rejectReason] || "").trim());
-  showProgress(`Dang lap pattern ${rejectedRows.length.toLocaleString("vi-VN")} dong tu choi`, 35);
+  showProgress(`Dang lap pattern ${rejectedRows.length.toLocaleString("vi-VN")} dong F68K tu choi`, 35);
   await waitFrame();
 
-  const rowPatterns = new Map();
-  const buckets = new Map();
-  rejectedRows.forEach((row) => {
+  const records = rejectedRows.map((row, index) => {
     const patterns = promotionReviewPatterns(row, columns);
-    rowPatterns.set(row.__rowNumber, patterns);
-    patterns.forEach((pattern) => {
-      if (!buckets.has(pattern.key)) buckets.set(pattern.key, { ...pattern, members: [] });
-      buckets.get(pattern.key).members.push(row);
+    return {
+      index,
+      row,
+      patterns,
+      keys: new Set(patterns.map((pattern) => pattern.key)),
+    };
+  });
+
+  const featureBuckets = new Map();
+  records.forEach((record) => {
+    record.patterns.forEach((pattern) => {
+      if (!featureBuckets.has(pattern.key)) featureBuckets.set(pattern.key, { ...pattern, records: [] });
+      featureBuckets.get(pattern.key).records.push(record.index);
     });
   });
 
-  showProgress("Dang tim dong tu choi le pattern", 70);
+  showProgress(`Dang gom group toi thieu ${minSignals} dac diem trung`, 70);
   await waitFrame();
 
-  let groupId = 1;
-  return rejectedRows
-    .map((row) => {
-      const matches = (rowPatterns.get(row.__rowNumber) || [])
-        .map((pattern) => buckets.get(pattern.key))
-        .filter((bucket) => bucket && bucket.members.length > 1);
-      const strongMatches = matches.filter((bucket) => bucket.strength === "strong");
-      const uniqueMatches = new Set();
-      matches.forEach((bucket) => {
-        bucket.members.forEach((member) => {
-          if (member.__rowNumber !== row.__rowNumber) uniqueMatches.add(member.__rowNumber);
-        });
-      });
-      const patternSummary = matches
-        .map((bucket) => `${bucket.label}: ${bucket.value} (${bucket.members.length})`)
-        .slice(0, 8)
-        .join("; ");
-      row.pattern_status = strongMatches.length ? "co_pattern_manh" : matches.length ? "chi_co_pattern_yeu" : "khong_cung_pattern";
-      row.pattern_matches = uniqueMatches.size;
-      row.pattern_signals = patternSummary || "Khong co cum dac diem lap lai trong cac dong tu choi";
-      return { row, matches, strongMatches };
-    })
-    .filter((item) => item.strongMatches.length === 0)
-    .map((item) => ({
-      id: groupId++,
-      source: "Tu choi khong cung pattern",
-      recommendation: "Can kiem tra lai quyet dinh tu choi: tai khoan nay khong co pattern manh lap lai voi cac dong tu choi khac trong file.",
-      maxScore: item.matches.length ? 20 : 0,
-      members: [item.row],
+  const pairCounts = new Map();
+  featureBuckets.forEach((bucket) => {
+    const indexes = [...new Set(bucket.records)].sort((a, b) => a - b);
+    for (let left = 0; left < indexes.length; left += 1) {
+      for (let right = left + 1; right < indexes.length; right += 1) {
+        const key = `${indexes[left]}:${indexes[right]}`;
+        pairCounts.set(key, (pairCounts.get(key) || 0) + 1);
+      }
+    }
+  });
+
+  const parent = records.map((_, index) => index);
+  const find = (index) => {
+    let current = index;
+    while (parent[current] !== current) {
+      parent[current] = parent[parent[current]];
+      current = parent[current];
+    }
+    return current;
+  };
+  const union = (left, right) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot;
+  };
+
+  pairCounts.forEach((count, key) => {
+    if (count < minSignals) return;
+    const [left, right] = key.split(":").map(Number);
+    union(left, right);
+  });
+
+  const components = new Map();
+  records.forEach((record) => {
+    const root = find(record.index);
+    if (!components.has(root)) components.set(root, []);
+    components.get(root).push(record);
+  });
+
+  const strongGroups = [...components.values()]
+    .filter((members) => members.length > 1 && members.some((left) => members.some((right) => left.index < right.index && (pairCounts.get(`${left.index}:${right.index}`) || 0) >= minSignals)))
+    .sort((a, b) => b.length - a.length || a[0].row.__rowNumber - b[0].row.__rowNumber);
+
+  const groupedRows = new Set(strongGroups.flatMap((members) => members.map((record) => record.index)));
+  const groups = strongGroups.map((members, index) => {
+    const commonKeys = [...members[0].keys].filter((key) => members.every((record) => record.keys.has(key)));
+    const patternByKey = new Map(members.flatMap((record) => record.patterns.map((pattern) => [pattern.key, pattern])));
+    const commonSignals = commonKeys.map((key) => patternByKey.get(key)).filter(Boolean);
+    const maxShared = Math.max(
+      minSignals,
+      ...members.flatMap((left) =>
+        members.map((right) => {
+          if (left.index >= right.index) return 0;
+          return pairCounts.get(`${left.index}:${right.index}`) || 0;
+        })
+      )
+    );
+    members.forEach((record) => {
+      record.row.pattern_status = `du_${minSignals}_dac_diem`;
+      record.row.pattern_matches = members.length - 1;
+      record.row.pattern_signals = summarizePromotionPatterns(record.patterns);
+    });
+    return {
+      id: `G${String(index + 1).padStart(4, "0")}`,
+      source: `Pattern manh - toi thieu ${minSignals} dac diem`,
+      recommendation: `Group nay co tai khoan F68K bi tu choi trung toi thieu ${minSignals} dac diem. Co the dung de bao cao/cung co ly do tu choi.`,
+      maxScore: maxShared,
+      members: members.map((record) => record.row),
       links: [],
-      signals: [
-        {
-          type: "reject_reason",
-          label: "Ly do tu choi",
-          value: item.row[columns.rejectReason] || "",
-          similarity: 1,
-          weight: 0,
-        },
-        {
-          type: "pattern_matches",
-          label: "Dong tu choi cung pattern",
-          value: String(item.row.pattern_matches),
-          similarity: 1,
-          weight: 0,
-        },
-        {
-          type: "pattern_signals",
-          label: "Pattern tim thay",
-          value: item.row.pattern_signals,
-          similarity: 1,
-          weight: 0,
-        },
-      ],
-    }));
+      signals: commonSignals.length
+        ? commonSignals.map((pattern) => promotionSignal(pattern))
+        : [
+            {
+              type: "min_shared",
+              label: "So dac diem trung",
+              value: String(maxShared),
+              similarity: 1,
+              weight: 0,
+            },
+          ],
+    };
+  });
+
+  let weakId = 1;
+  records
+    .filter((record) => !groupedRows.has(record.index))
+    .forEach((record) => {
+      const repeatedPatterns = record.patterns
+        .map((pattern) => featureBuckets.get(pattern.key))
+        .filter((bucket) => bucket && bucket.records.length > 1);
+      const bestShared = Math.max(
+        0,
+        ...records.map((other) => {
+          if (other.index === record.index) return 0;
+          return [...record.keys].filter((key) => other.keys.has(key)).length;
+        })
+      );
+      record.row.pattern_status = `chua_du_${minSignals}_dac_diem`;
+      record.row.pattern_matches = bestShared;
+      record.row.pattern_signals = repeatedPatterns.length
+        ? repeatedPatterns.map((bucket) => `${bucket.label}: ${bucket.value} (${bucket.records.length})`).join("; ")
+        : "Khong co dac diem lap lai";
+      groups.push({
+        id: `W${String(weakId++).padStart(4, "0")}`,
+        source: `Pattern yeu - chua du ${minSignals} dac diem`,
+        recommendation: `Can ra lai: tai khoan F68K bi tu choi nhung chua trung du ${minSignals} dac diem voi tai khoan tu choi khac.`,
+        maxScore: bestShared,
+        members: [record.row],
+        links: [],
+        signals: [
+          {
+            type: "best_shared",
+            label: "So dac diem trung cao nhat",
+            value: String(bestShared),
+            similarity: 1,
+            weight: 0,
+          },
+          {
+            type: "pattern_signals",
+            label: "Pattern tim thay",
+            value: record.row.pattern_signals,
+            similarity: 1,
+            weight: 0,
+          },
+        ],
+      });
+    });
+
+  return groups;
 }
 
 function getPromotionReviewColumns() {
@@ -610,6 +711,20 @@ function promotionReviewPatterns(row, columns) {
   if (agent && bank) add("agent_bank", "Dai ly + ngan hang", `${agent}|${bank}`, "weak");
   if (agent && ipRange) add("agent_ip_range", "Dai ly + dai IP", `${agent}|${ipRange}`);
   return patterns;
+}
+
+function promotionSignal(pattern) {
+  return {
+    type: pattern.type,
+    label: pattern.label,
+    value: pattern.value,
+    similarity: 1,
+    weight: 0,
+  };
+}
+
+function summarizePromotionPatterns(patterns) {
+  return patterns.map((pattern) => `${pattern.label}: ${pattern.value}`).join("; ");
 }
 
 function bankAccountPrefix(value) {
@@ -1813,7 +1928,7 @@ function buildCrossGroupDuplicateInfo() {
       groupsByAccount.get(key).add(group.id);
     });
   });
-  return new Map([...groupsByAccount.entries()].map(([key, ids]) => [key, [...ids].sort((a, b) => a - b)]));
+  return new Map([...groupsByAccount.entries()].map(([key, ids]) => [key, [...ids].sort((a, b) => String(a).localeCompare(String(b), "vi", { numeric: true }))]));
 }
 
 function accountKeyForMember(member) {
